@@ -3,6 +3,9 @@
  * Three.js hero scene in #hero-canvas: procedural molar (spheres + capsules,
  * MeshPhysicalMaterial w/ clearcoat) floating in ~300 additive glowing particles.
  * Auto-rotation + mouse parallax + drag-to-rotate + float bob.
+ * Quality pass: ACESFilmic tone mapping + sRGB output, PMREM studio environment
+ * (procedural, no external HDR), physically-based 4-point light rig, cast-free
+ * soft materials, canvas-sprite round glow particles.
  * DPR capped at 2, ResizeObserver, pauses when tab hidden, static frame under
  * prefers-reduced-motion, full disposal on pagehide. No external model files.
  * MIT (c) 2049 Dentara demo.
@@ -27,6 +30,9 @@
   renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'low-power' });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, DPR_CAP));
   renderer.setClearColor(0x000000, 0);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.06;
   container.appendChild(renderer.domElement);
   renderer.domElement.style.width = '100%';
   renderer.domElement.style.height = '100%';
@@ -38,38 +44,87 @@
   camera.position.set(0, 0.35, 7.2);
   camera.lookAt(0, 0, 0);
 
-  /* ---------- lights ---------- */
-  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  /* ---------- lights (physically-based) ---------- */
+  const ambient = new THREE.AmbientLight(0xfff4ea, 0.4);
+  scene.add(ambient);
 
-  const keyLight = new THREE.DirectionalLight(0xffffff, 1.15);
+  const hemi = new THREE.HemisphereLight(0xffffff, 0xffe4cc, 0.35);
+  scene.add(hemi);
+
+  const keyLight = new THREE.DirectionalLight(0xffffff, 1.6);
   keyLight.position.set(3.5, 4.5, 5);
   scene.add(keyLight);
 
+  // soft fill from camera-left to open up shadowed cusps
+  const fillLight = new THREE.DirectionalLight(0xfff1e4, 0.35);
+  fillLight.position.set(-3, 1, 4);
+  scene.add(fillLight);
+
   // warm orange rim lights from both sides
-  const rimA = new THREE.DirectionalLight(0xff8c42, 1.5);
+  const rimA = new THREE.DirectionalLight(0xff8c42, 2.0);
   rimA.position.set(-5, 1.5, -3);
   scene.add(rimA);
 
-  const rimB = new THREE.DirectionalLight(0xffb877, 0.9);
+  const rimB = new THREE.DirectionalLight(0xffb877, 1.1);
   rimB.position.set(5, -2, -4);
   scene.add(rimB);
 
   /* ---------- procedural tooth (molar) ---------- */
+  // Tiny PMREM room environment: gives clearcoat/reflections real structure
+  // without loading any external HDR file (keeps the page dependency-free).
+  function buildStudioEnvironment() {
+    const envScene = new THREE.Scene();
+    envScene.background = new THREE.Color(0x0d0b09);
+    const geo = new THREE.PlaneGeometry(1, 1);
+    const addPanel = (color, intensity, x, y, z, lookAtOrigin) => {
+      const mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(color).multiplyScalar(intensity) });
+      mat.toneMapped = false;
+      const panel = new THREE.Mesh(geo, mat);
+      panel.position.set(x, y, z);
+      if (lookAtOrigin) panel.lookAt(0, 0, 0);
+      envScene.add(panel);
+    };
+    // key softbox (large, slightly warm white, upper front)
+    addPanel(0xffffff, 6.0, 4, 5, 4, true);
+    // cool-neutral fill panel (left)
+    addPanel(0xfff1e4, 2.2, -5, 1.5, 3, true);
+    // warm brand strip behind-left — the 2049 signature glow
+    addPanel(0xff8c42, 4.5, -4, 0.5, -4, true);
+    // warm counter-strip behind-right
+    addPanel(0xffb877, 2.5, 4.5, -1.5, -4, true);
+    // faint floor bounce
+    addPanel(0xffe4cc, 0.8, 0, -5, 0, false);
+
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    const envRT = pmrem.fromScene(envScene, 0.18);
+    pmrem.dispose();
+    envScene.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+    return envRT.texture;
+  }
+  const envMap = buildStudioEnvironment();
+
   const crownMat = new THREE.MeshPhysicalMaterial({
     color: 0xfdfbf7,        // porcelain white
-    roughness: 0.22,
+    roughness: 0.16,
     metalness: 0.0,
     clearcoat: 1.0,
-    clearcoatRoughness: 0.18,
-    envMapIntensity: 0.8
+    clearcoatRoughness: 0.12,
+    envMap: envMap,
+    envMapIntensity: 1.1,
+    sheen: 0.25,
+    sheenColor: new THREE.Color(0xfff1e4),
+    iridescence: 0.06,
+    iridescenceIOR: 1.3
   });
 
   const goldMat = new THREE.MeshPhysicalMaterial({
     color: 0xff8c42,        // warm orange "gold" inlay
-    roughness: 0.28,
-    metalness: 0.15,
-    clearcoat: 0.9,
-    clearcoatRoughness: 0.25
+    roughness: 0.22,
+    metalness: 0.35,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.15,
+    envMap: envMap,
+    envMapIntensity: 1.25
   });
 
   toothGroup = new THREE.Group();
@@ -130,11 +185,30 @@
   const pGeo = new THREE.BufferGeometry();
   pGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
 
+  // Soft radial glow sprite — round bokeh particles instead of hard squares
+  function buildParticleSprite() {
+    const S = 64;
+    const cv = document.createElement('canvas');
+    cv.width = S; cv.height = S;
+    const ctx = cv.getContext('2d');
+    const g = ctx.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, S / 2);
+    g.addColorStop(0.0, 'rgba(255, 190, 140, 1)');
+    g.addColorStop(0.35, 'rgba(255, 162, 94, 0.55)');
+    g.addColorStop(1.0, 'rgba(255, 140, 66, 0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, S, S);
+    const tex = new THREE.CanvasTexture(cv);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+  const particleTexture = buildParticleSprite();
+
   particleMaterial = new THREE.PointsMaterial({
     color: 0xffa25e,
-    size: 0.055,
+    size: 0.085,
+    map: particleTexture,
     transparent: true,
-    opacity: 0.85,
+    opacity: 0.7,
     blending: THREE.AdditiveBlending,
     depthWrite: false,
     sizeAttenuation: true
@@ -250,6 +324,8 @@
     crownMat.dispose();
     goldMat.dispose();
     particleMaterial.dispose();
+    if (particleTexture) particleTexture.dispose();
+    if (typeof envMap !== 'undefined' && envMap) envMap.dispose();
     renderer.dispose();
     if (renderer.domElement && renderer.domElement.parentNode) {
       renderer.domElement.parentNode.removeChild(renderer.domElement);

@@ -209,12 +209,12 @@
       el.textContent = formatNumber(target) + suffix;
       return;
     }
-    var duration = 1800;
+    var duration = 2200;
     var start = null;
     function frame(ts) {
       if (start === null) start = ts;
       var p = Math.min((ts - start) / duration, 1);
-      var eased = 1 - Math.pow(1 - p, 3); /* ease-out cubic */
+      var eased = 1 - Math.pow(1 - p, 4); /* ease-out quartic — faster start, gentler settle */
       el.textContent = formatNumber(Math.round(target * eased)) + suffix;
       if (p < 1) window.requestAnimationFrame(frame);
     }
